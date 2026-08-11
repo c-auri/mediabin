@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+#
+# Turn a gif into a video that alternates forward and backward (boomerang)
+# and loops seamlessly into itself.
+#
+# The duplicate frames at the turnaround and at the loop seam are trimmed,
+# and the length is rounded up to a whole number of forward+backward cycles,
+# so the video always ends on a completed backward segment.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: gif-loop.sh <input.gif> <minimum-seconds> [output.mp4]
+
+Produces a boomerang loop of at least <minimum-seconds>, rounded up to a whole
+forward+backward cycle. Output defaults to <input basename>-loop.mp4.
+
+Environment overrides:
+  FPS=30    constant frame rate for the output
+  CRF=16    libx264 quality (lower is better, 18-23 is typical)
+
+Example:
+  bash gif-loop.sh clip.gif 90
+  FPS=24 CRF=20 bash gif-loop.sh clip.gif 12.5 intro.mp4
+EOF
+}
+
+if [[ $# -lt 2 || $# -gt 3 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 1
+fi
+
+GIF="$1"
+MINDUR="$2"
+OUT="${3:-$(basename "${GIF%.*}")-loop.mp4}"
+
+FPS="${FPS:-30}"
+CRF="${CRF:-16}"
+
+for cmd in ffmpeg ffprobe awk; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "error: $cmd not found" >&2; exit 1; }
+done
+
+[[ -r "$GIF" ]] || { echo "error: cannot read $GIF" >&2; exit 1; }
+
+awk -v d="$MINDUR" 'BEGIN{exit !(d+0 > 0)}' \
+    || { echo "error: minimum duration must be a positive number of seconds" >&2; exit 1; }
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# 1. Normalize: even dimensions (libx264 with yuv420p rejects odd ones) and a
+#    constant frame rate. Lossless intermediate, so the boomerang encode below
+#    is the only lossy step. Frames are counted after this pass so the trim
+#    indices refer to the same timeline as the frames being trimmed.
+echo ">> normalizing gif at ${FPS} fps"
+ffmpeg -hide_banner -loglevel error -y -i "$GIF" \
+    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=$FPS" \
+    -c:v ffv1 "$TMP/fwd.mkv"
+
+N=$(ffprobe -v error -select_streams v:0 -count_frames \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$TMP/fwd.mkv")
+
+[[ -n "$N" && "$N" -ge 3 ]] || { echo "error: gif has too few frames (${N:-0}) to boomerang" >&2; exit 1; }
+
+# 2. Boomerang: N forward frames plus the reversed clip with its first frame
+#    (a duplicate of the turnaround) and its last frame (a duplicate of the loop
+#    seam) dropped. trim's end_frame is exclusive, so this keeps frames 1..N-2.
+#    The trailing fps is not redundant: reverse discards the frame rate
+#    metadata, so concat's output rate is unknown and ffmpeg would silently fall
+#    back to its 25 fps default and resample, throwing frames away.
+echo ">> building boomerang ($N forward + $((N - 2)) reverse frames)"
+ffmpeg -hide_banner -loglevel error -y -i "$TMP/fwd.mkv" -filter_complex \
+    "[0:v]split[a][b];
+     [b]reverse,trim=start_frame=1:end_frame=$((N - 1)),setpts=PTS-STARTPTS[r];
+     [a][r]concat=n=2:v=1,fps=$FPS[v]" \
+    -map "[v]" -c:v libx264 -crf "$CRF" -pix_fmt yuv420p -an "$TMP/boomerang.mp4"
+
+CYCLE=$((2 * N - 2))
+ACTUAL=$(ffprobe -v error -select_streams v:0 -count_frames \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$TMP/boomerang.mp4")
+if [[ "$ACTUAL" -ne "$CYCLE" ]]; then
+    echo "error: boomerang has $ACTUAL frames, expected $CYCLE; loop would not be seamless" >&2
+    exit 1
+fi
+
+# 3. Cycle length comes from the frame count rather than the container duration,
+#    so rounding does not accumulate across many loops.
+B=$(awk -v f="$CYCLE" -v r="$FPS" 'BEGIN{print f/r}')
+K=$(awk -v d="$MINDUR" -v b="$B" 'BEGIN{x=d/b; print int(x)+(x>int(x)?1:0)}')
+V=$(awk -v k="$K" -v b="$B" 'BEGIN{print k*b}')
+
+# 4. -stream_loop repeats the identical encoded frames, so -c:v copy is exact
+#    and costs nothing. The result is exactly K*CYCLE frames.
+echo ">> looping $K cycles"
+ffmpeg -hide_banner -loglevel error -y -stream_loop $((K - 1)) -i "$TMP/boomerang.mp4" \
+    -c:v copy -movflags +faststart "$OUT"
+
+printf '\n%s\n' "wrote $OUT"
+printf 'cycles: %s (%s segments)  cycle: %ss  total: %ss  requested: %ss\n' \
+    "$K" "$((K * 2))" "$B" "$V" "$MINDUR"

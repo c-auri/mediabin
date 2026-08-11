@@ -1,0 +1,32 @@
+#!/bin/bash
+
+set -e              # exit on error
+shopt -s nullglob   # skip loop when pattern has no matches
+
+for webp in *.webp
+do
+    jpg="${webp%.webp}.jpg"
+    echo "Converting: $webp -> $jpg"
+    convert "$webp" "$jpg" && rm "$webp"
+done
+
+for gif in *.gif; do
+    mp4="${gif%.gif}.mp4"
+    echo "Converting: $gif -> $mp4"
+
+    # FFmpeg options:
+    # -y                  → overwrite output files without asking
+    # -v warning          → show only warnings/errors (reduce log noise)
+    # -stats              → display a single updating progress line
+    # -movflags faststart → move metadata to beginning (better playback/streaming)
+    # -pix_fmt yuv420p    → ensure compatibility with most players
+    # -vf scale=...       → force even dimensions (required for many codecs)
+    ffmpeg -y -i "$gif" \
+        -v warning \
+        -stats \
+        -movflags faststart \
+        -pix_fmt yuv420p \
+        -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+        "$mp4" \
+    && rm "$gif"
+done
