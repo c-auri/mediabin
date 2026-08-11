@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Turn a gif into a video that alternates forward and backward (boomerang)
 # and loops seamlessly into itself.
 #
