@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+
+# mediabin dispatcher: runs the executables in commands/ as subcommands.
+
+set -euo pipefail
+shopt -s nullglob
+
+prog=${0##*/}
+
+# $0 is the full path even when found on PATH,
+# and readlink -f follows the symlink to the real file,
+# so commands/ is found no matter where mb is invoked from.
+root=$(dirname -- "$(readlink -f -- "$0")")
+commands_dir="$root/commands"
+
+function die
+{
+  printf '%s: %s\n' "$prog" "$1" >&2
+  exit "${2:-1}"
+}
+
+# Every executable file in commands/, one path per line.
+function command_paths
+{
+  local path
+  for path in "$commands_dir"/*
+  do
+    if [[ -f $path && -x $path ]]
+    then
+      printf '%s\n' "$path"
+    fi
+  done
+}
+
+# The summary= line, read rather than executed: a script that is broken or slow
+# to start still gets listed instead of taking the whole listing down with it.
+function summary_of
+{
+  sed -n '/^summary="/{s/^summary="\(.*\)"$/\1/p;q;}' -- "$1"
+}
+
+function command_list
+{
+  local path name width=0
+
+  while IFS= read -r path
+  do
+    name=${path##*/}
+    if (( ${#name} > width ))
+    then
+      width=${#name}
+    fi
+  done < <(command_paths)
+
+  if (( width == 0 ))
+  then
+    printf '  (none in %s)\n' "$commands_dir"
+    return
+  fi
+
+  local summary
+  while IFS= read -r path
+  do
+    name=${path##*/}
+    summary=$(summary_of "$path")
+    if [[ -n $summary ]]
+    then
+      printf '  %-*s  %s\n' "$width" "$name" "$summary"
+    else
+      printf '  %s\n' "$name"
+    fi
+  done < <(command_paths)
+}
+
+function usage
+{
+  printf 'usage: %s <command> [args...]\n\n' "$prog"
+  printf 'commands:\n'
+  command_list
+  printf "\nrun '%s help <command>' for details on one command.\n" "$prog"
+}
+
+[[ -d $commands_dir ]] || die "missing command directory: $commands_dir"
+
+# No arguments is a usage error, so the listing goes to stderr with a non-zero
+# exit. mb help prints the same listing to stdout and exits 0, so it can be
+# piped and grepped.
+if (( $# == 0 ))
+then
+  usage >&2
+  exit 1
+fi
+
+cmd=$1
+shift
+
+if [[ $cmd == help || $cmd == -h || $cmd == --help ]]
+then
+  if (( $# == 0 ))
+  then
+    usage
+    exit 0
+  fi
+
+  # mb help <cmd> is the form most people try first; rewrite it to the -h that
+  # every subcommand already supports. mb <cmd> -h works for free.
+  cmd=$1
+  set -- -h
+fi
+
+# Checked before touching the filesystem, so mb ../../something cannot escape
+# commands/.
+[[ $cmd != */* ]] || die "not a command name: $cmd" 127
+
+target="$commands_dir/$cmd"
+
+if [[ ! -f $target || ! -x $target ]]
+then
+  {
+    printf '%s: no such command: %s\n\n' "$prog" "$cmd"
+    usage
+  } >&2
+  exit 127
+fi
+
+# Subcommands build their usage text from MB_PROG, so -h under the dispatcher
+# describes "mb rotate" rather than a bare "rotate" that is not on PATH.
+export MB_PROG="$prog $cmd"
+
+# exec, so the subcommand's exit code, signals and stdio are the dispatcher's.
+exec "$target" "$@"
