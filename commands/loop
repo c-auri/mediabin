@@ -9,9 +9,14 @@
 
 set -euo pipefail
 
+summary="turn a gif into a seamless forward-and-back loop"
+prog=${MB_PROG:-${0##*/}}
+
 usage() {
-    cat <<'EOF'
-Usage: gif-loop.sh <input.gif> <minimum-seconds> [output.mp4]
+    cat <<EOF
+$prog: $summary
+
+Usage: $prog <input.gif> <minimum-seconds> [output.mp4]
 
 Produces a boomerang loop of at least <minimum-seconds>, rounded up to a whole
 forward+backward cycle. Output defaults to <input basename>-loop.mp4.
@@ -21,13 +26,18 @@ Environment overrides:
   CRF=16    libx264 quality (lower is better, 18-23 is typical)
 
 Example:
-  bash gif-loop.sh clip.gif 90
-  FPS=24 CRF=20 bash gif-loop.sh clip.gif 12.5 intro.mp4
+  $prog clip.gif 90
+  FPS=24 CRF=20 $prog clip.gif 12.5 intro.mp4
 EOF
 }
 
-if [[ $# -lt 2 || $# -gt 3 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
+    exit 0
+fi
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+    usage >&2
     exit 1
 fi
 

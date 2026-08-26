@@ -16,7 +16,7 @@ Three short one-word verbs, four to six letters, tab-completing after two charac
 | `gif-loop`  | `loop`   | ffmpeg     |
 | `cnvrt`     | `deweb`  | both       |
 
-The names can be plain and literal because the collection is uniform: with no viewer in the set, `loop` cannot be read as a playback mode nor `rotate` as "play this rotated". Membership implies that a command reads a file and writes a new one, which is why the rule above is worth holding to.
+The names can be plain and literal because nothing here plays anything: with no player in the set, `loop` cannot be read as a playback mode nor `rotate` as "play this rotated". That is what the exclusion above buys, and the reason it is worth holding to.
 
 `deweb` covers webp to jpg exactly and gif to mp4 loosely, since gif is more an awkward legacy format than a web one. It names the blast radius rather than the mechanism, and still undersells it: the command sweeps the whole current directory and deletes each original after a successful conversion. The old name was vowel-stripped to dodge `convert`, ImageMagick's own binary. Nothing in `commands/` is ever on `PATH`, so that pressure is gone.
 
@@ -82,13 +82,10 @@ Usage text derives the program name from the environment rather than from `$0`: 
 
 ## Still to do
 
-1. `rm convertwebp`. It is an earlier, buggier version of the webp half of `deweb`: it splits filenames on the first dot via `cut -d'.' -f1`, so `my.photo.webp` is written out as `my.jpg`.
-1. Create `commands/` and move each script in under its new name. Drop the `.sh` from `gif-loop.sh`, the only script carrying an extension; it is already executable.
 1. Write `mb`.
-1. Add the `summary` variable to each of the three scripts and print it from their usage text. `rotate` and `loop` already have usage functions to extend; `deweb` has none and needs one.
-1. Switch `rotate` from `prog=${0##*/}` to the `MB_PROG` form. Fix the usage text in `loop`, which hardcodes the string `gif-loop.sh` in three places including its examples.
+1. Bring each script up to the conventions above, one pass per file. `rotate` and `deweb` are still `#!/bin/bash`; `deweb` uses `set -e` and needs `set -euo pipefail`, keeping its `shopt -s nullglob`, which is what makes the loops skip when nothing matches. All three need the `summary` variable printed from their usage text, and `deweb` has no usage function at all yet. `rotate` also switches from `prog=${0##*/}` to the `MB_PROG` form.
+1. Fix the usage text in `loop`, which hardcodes the string `gif-loop.sh` in three places including its examples.
 1. Symlink `~/.local/bin/mb` to `mediabin/mb` and verify each command still runs.
-1. Write the completion file and create the user completions directory it lives in.
 1. Write `README.md`: the three commands, one line each, plus the installation symlink and the conventions a fourth script would need to follow.
 
 ## Future

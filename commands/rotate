@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Rotate a video 90 degrees clockwise or counter-clockwise with ffmpeg.
 # Preview mode writes one still frame per direction, so you can see which way
@@ -9,7 +9,8 @@
 
 set -euo pipefail
 
-prog=${0##*/}
+summary="rotate a video 90 degrees, with a preview mode"
+prog=${MB_PROG:-${0##*/}}
 
 input=""
 direction=""
@@ -33,6 +34,8 @@ function die
 function usage
 {
   cat <<EOF
+$prog: $summary
+
 Usage:
   $prog <input> -preview
   $prog <input> (-cw | -ccw) [options]
