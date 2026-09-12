@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+
+# Convert gifs to mp4, one per argument, writing next to each input.
+
+set -euo pipefail
+
+summary="convert gifs to mp4, leaving the originals in place"
+prog=${MB_PROG:-${0##*/}}
+
+force=false
+output=""
+inputs=()
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog [options] <file.gif>...
+
+Writes <stem>.mp4 next to each input and leaves the gif alone. Deleting the
+originals is a separate step, which the exit status makes safe to chain:
+
+  $prog *.gif && rm *.gif
+
+Anything that is not a gif is skipped with a warning and counted as a failure,
+so a wide glob does not need to be aimed carefully.
+
+Options:
+  -o FILE        output path, only valid with a single input
+  -force         overwrite an existing output file
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+Exit status is 0 when every file converted, 1 when any file failed, and 2 for a
+usage error or a missing dependency.
+EOF
+}
+
+function need_value
+{
+  # $1 = flag name, $2 = number of arguments still unparsed
+  [[ $2 -ge 2 ]] || die "$1 requires a value"
+}
+
+# The video stream's codec name: 'gif' for a gif, the codec name for anything
+# else with a picture in it, empty for a file with no video stream at all. The
+# call exits 0 in that empty case, so emptiness is the test, not the status.
+function video_codec
+{
+  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# The input's own name with its extension replaced, in the input's directory.
+function sibling
+{
+  # $1 = input path, $2 = new extension
+  local dir base stem
+  dir=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  stem="${base%.*}"
+
+  # a dotfile with no second extension strips to nothing, so keep all of it
+  if [[ -z "$stem" ]]
+  then
+    stem="$base"
+  fi
+
+  if [[ "$dir" == "." ]]
+  then
+    printf '%s.%s\n' "$stem" "$2"
+  else
+    printf '%s/%s.%s\n' "$dir" "$stem" "$2"
+  fi
+}
+
+function same_file
+{
+  [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$2")" ]]
+}
+
+# ffmpeg reads a leading dash as an option, so such a path needs a ./ in front
+function ffpath
+{
+  case "$1" in
+    -*) printf './%s\n' "$1" ;;
+    *)  printf '%s\n' "$1" ;;
+  esac
+}
+
+function dims_of
+{
+  local dims
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0 -i "$1" 2>/dev/null)
+  printf '%s' "${dims/,/x}"
+}
+
+function size_of
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$(stat -c %s -- "$1")"
+}
+
+function convert_one
+{
+  local input="$1" out codec clobber
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  codec=$(video_codec "$input")
+
+  if [[ "$codec" != "gif" ]]
+  then
+    warn "$input: not a gif, skipping"
+    return 1
+  fi
+
+  if [[ -n "$output" ]]
+  then
+    out="$output"
+  else
+    out=$(sibling "$input" mp4)
+  fi
+
+  if same_file "$input" "$out"
+  then
+    warn "$input: output would overwrite the input"
+    return 1
+  fi
+
+  if [[ -e "$out" ]] && ! $force
+  then
+    warn "$input: $out already exists (use -force to overwrite)"
+    return 1
+  fi
+
+  if $force
+  then
+    clobber="-y"
+  else
+    clobber="-n"
+  fi
+
+  # yuv420p for player compatibility, the scale expression to force even
+  # dimensions because libx264 rejects odd ones, faststart to put the metadata
+  # at the front of the file.
+  if ! ffmpeg -hide_banner "$clobber" -v warning -stats -i "$input" \
+    -movflags faststart \
+    -pix_fmt yuv420p \
+    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+    "$(ffpath "$out")"
+  then
+    warn "$input: ffmpeg failed"
+    return 1
+  fi
+
+  printf 'wrote %s (%s, %s)\n' "$out" "$(dims_of "$out")" "$(size_of "$out")"
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -o)
+      need_value "$1" $#
+      output="$2"
+      shift 2
+      ;;
+    -force)
+      force=true
+      shift
+      ;;
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "$output" && ${#inputs[@]} -gt 1 ]]
+then
+  die "-o takes a single input, got ${#inputs[@]}"
+fi
+
+for cmd in ffmpeg ffprobe numfmt
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+converted=0
+failed=0
+
+for input in "${inputs[@]}"
+do
+  if convert_one "$input"
+  then
+    converted=$((converted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done
+
+if [[ ${#inputs[@]} -gt 1 ]]
+then
+  printf '\n%d converted, %d failed\n' "$converted" "$failed"
+fi
+
+[[ $failed -eq 0 ]] || exit 1
