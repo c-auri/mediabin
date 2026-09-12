@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+
+# Strip the audio track from a video, one file per argument, writing next to
+# each input.
+#
+# This is a stream copy, not a re-encode: the video bitstream comes out
+# byte-identical and the whole thing takes milliseconds. Every stream except
+# audio is carried over, so a second video track, subtitles or attachments
+# survive.
+
+set -euo pipefail
+
+summary="strip the audio track from a video, without re-encoding"
+prog=${MB_PROG:-${0##*/}}
+
+force=false
+output=""
+inputs=()
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog [options] <file>...
+
+Writes <stem>-muted.<ext> next to each input, keeping the same container. The
+video is copied rather than re-encoded, so there is no quality loss and no
+encoding time.
+
+A file with no audio, and a file with no video, are both skipped with a warning
+and counted as failures, so a wide glob does not need to be aimed carefully.
+
+Options:
+  -o FILE        output path, only valid with a single input
+  -force         overwrite an existing output file
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+Exit status is 0 when every file converted, 1 when any file failed, and 2 for a
+usage error or a missing dependency.
+EOF
+}
+
+function need_value
+{
+  # $1 = flag name, $2 = number of arguments still unparsed
+  [[ $2 -ge 2 ]] || die "$1 requires a value"
+}
+
+# The video stream's codec name, empty for a file with no video stream at all.
+# The call exits 0 in that empty case, so emptiness is the test, not the status.
+function video_codec
+{
+  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# The audio stream's codec name, empty for a file with no audio stream.
+function audio_codec
+{
+  ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# The input's own name with a suffix added before its extension, in the input's
+# directory. Unlike the conversion commands, the container does not change, so
+# the name has to differ some other way.
+function sibling
+{
+  # $1 = input path, $2 = suffix
+  local dir base stem ext name
+  dir=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  stem="${base%.*}"
+  ext="${base##*.}"
+
+  # a basename with no dot leaves stem and ext both equal to the whole thing
+  if [[ "$stem" == "$base" ]]
+  then
+    ext=""
+  fi
+
+  # a dotfile with no second extension strips to nothing, so keep all of it
+  if [[ -z "$stem" ]]
+  then
+    stem="$base"
+    ext=""
+  fi
+
+  if [[ -n "$ext" ]]
+  then
+    name="$stem-$2.$ext"
+  else
+    name="$stem-$2"
+  fi
+
+  if [[ "$dir" == "." ]]
+  then
+    printf '%s\n' "$name"
+  else
+    printf '%s/%s\n' "$dir" "$name"
+  fi
+}
+
+function same_file
+{
+  [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$2")" ]]
+}
+
+# ffmpeg reads a leading dash as an option, so such a path needs a ./ in front
+function ffpath
+{
+  case "$1" in
+    -*) printf './%s\n' "$1" ;;
+    *)  printf '%s\n' "$1" ;;
+  esac
+}
+
+function dims_of
+{
+  local dims
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0 -i "$1" 2>/dev/null)
+  printf '%s' "${dims/,/x}"
+}
+
+function size_of
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$(stat -c %s -- "$1")"
+}
+
+function convert_one
+{
+  local input="$1" out clobber
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  if [[ -z "$(video_codec "$input")" ]]
+  then
+    warn "$input: no video stream, skipping"
+    return 1
+  fi
+
+  if [[ -z "$(audio_codec "$input")" ]]
+  then
+    warn "$input: no audio to remove, skipping"
+    return 1
+  fi
+
+  if [[ -n "$output" ]]
+  then
+    out="$output"
+  else
+    out=$(sibling "$input" muted)
+  fi
+
+  if same_file "$input" "$out"
+  then
+    warn "$input: output would overwrite the input"
+    return 1
+  fi
+
+  if [[ -e "$out" ]] && ! $force
+  then
+    warn "$input: $out already exists (use -force to overwrite)"
+    return 1
+  fi
+
+  if $force
+  then
+    clobber="-y"
+  else
+    clobber="-n"
+  fi
+
+  # -map 0 -map -0:a takes every stream except audio. Relying on ffmpeg's
+  # default stream selection instead would silently drop a second video track
+  # or any attachments.
+  if ! ffmpeg -hide_banner "$clobber" -v warning -i "$input" \
+    -map 0 -map -0:a -c copy \
+    "$(ffpath "$out")"
+  then
+    warn "$input: ffmpeg failed"
+    return 1
+  fi
+
+  printf 'wrote %s (%s, %s)\n' "$out" "$(dims_of "$out")" "$(size_of "$out")"
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -o)
+      need_value "$1" $#
+      output="$2"
+      shift 2
+      ;;
+    -force)
+      force=true
+      shift
+      ;;
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "$output" && ${#inputs[@]} -gt 1 ]]
+then
+  die "-o takes a single input, got ${#inputs[@]}"
+fi
+
+for cmd in ffmpeg ffprobe numfmt
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+converted=0
+failed=0
+
+for input in "${inputs[@]}"
+do
+  if convert_one "$input"
+  then
+    converted=$((converted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done
+
+if [[ ${#inputs[@]} -gt 1 ]]
+then
+  printf '\n%d converted, %d failed\n' "$converted" "$failed"
+fi
+
+[[ $failed -eq 0 ]] || exit 1

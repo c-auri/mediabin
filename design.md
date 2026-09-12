@@ -4,11 +4,11 @@
 
 Personal shell wrappers around ffmpeg and ImageMagick, collected into one directory so they can live in version control and share a naming scheme. The `bin` in the name does double duty: a grab bag of tools, and the fact that the dispatcher is symlinked into `~/.local/bin`.
 
-Every command takes a file, transforms it, and writes the result to disk. That uniformity is the defining property of the collection and the reason it can share one entrypoint.
+These are editing utilities, not playback. Every command takes file paths on the command line and either transforms a file and writes the result to disk, or reports on what a file contains. Playback is a distinct category of operation on video and images, and it is the one thing that does not belong here: a command that opens a window belongs in `~/.local/bin` as a standalone executable instead.
 
 ## Naming
 
-Three short one-word verbs, four to six letters, tab-completing after two characters.
+A name should hint at what the command produces. That is the whole rule: there is nothing to say about length or parts of speech, and `info` reads as clearly as `resize` does.
 
 | old         | new      | backend    |
 |-------------|----------|------------|

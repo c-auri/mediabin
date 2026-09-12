@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+
+# Print the properties of a media file: size, duration, dimensions, bitrates.
+#
+# The one command here that reports rather than writes. Fields that do not
+# apply to a file are left out, so a still image shows dimensions and size and
+# an audio file shows duration and bitrates.
+
+set -euo pipefail
+
+summary="print dimensions, duration, size and bitrates of a media file"
+prog=${MB_PROG:-${0##*/}}
+
+inputs=()
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog <file>...
+
+Prints one block per file. With more than one file each block is preceded by
+the filename, so the output of a glob stays readable.
+
+Fields that do not apply are omitted: a still image has no duration or fps, an
+audio file has no dimensions. Rotation appears only when the file carries it,
+and dimensions are always the displayed ones: a file that plays portrait is
+reported portrait, whatever way round its pixels happen to be stored.
+
+Options:
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+Exit status is 0 when every file could be read, 1 when any could not, and 2 for
+a usage error or a missing dependency.
+EOF
+}
+
+function fmt_size
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$1"
+}
+
+function fmt_duration
+{
+  LC_ALL=C awk -v d="$1" 'BEGIN {
+    t = int(d + 0.5)
+    h = int(t / 3600); m = int((t % 3600) / 60); s = t % 60
+    if (h > 0) printf "%d:%02d:%02d", h, m, s
+    else       printf "%d:%02d", m, s
+  }'
+}
+
+function fmt_bitrate
+{
+  LC_ALL=C awk -v b="$1" 'BEGIN {
+    if (b + 0 >= 1000000)   printf "%.1f Mbps", b / 1000000
+    else if (b + 0 >= 1000) printf "%.0f kbps", b / 1000
+    else                    printf "%d bps", b
+  }'
+}
+
+function fmt_fps
+{
+  # r_frame_rate arrives as a fraction, 30/1 or 30000/1001
+  LC_ALL=C awk -v r="$1" 'BEGIN {
+    n = split(r, a, "/")
+    if (n != 2 || a[2] + 0 == 0) exit
+    v = a[1] / a[2]
+    if (v == int(v)) printf "%d", v
+    else             printf "%.2f", v
+  }'
+}
+
+function fmt_aspect
+{
+  # $1 = display_aspect_ratio if ffprobe knew one, $2 = width, $3 = height
+  if [[ -n "$1" && "$1" != "N/A" && "$1" != "0:1" ]]
+  then
+    printf '%s' "$1"
+    return
+  fi
+
+  LC_ALL=C awk -v w="$2" -v h="$3" 'BEGIN {
+    if (w + 0 <= 0 || h + 0 <= 0) exit
+    a = w; b = h
+    while (b) { t = b; b = a % b; a = t }
+    printf "%d:%d", w / a, h / a
+  }'
+}
+
+function field
+{
+  printf '  %-14s %s\n' "$1" "$2"
+}
+
+function report_one
+{
+  local input="$1"
+  local dur="" size="" obr="" w="" h="" dar="" rfr="" vbr="" abr="" rot="" swap=""
+  local key value
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  while IFS='=' read -r key value
+  do
+    case "$key" in
+      duration) dur="$value" ;;
+      size)     size="$value" ;;
+      bit_rate) obr="$value" ;;
+    esac
+  done < <(ffprobe -v error -show_entries format=duration,size,bit_rate \
+    -of default=noprint_wrappers=1 -i "$input" 2>/dev/null)
+
+  if [[ -z "$size" ]]
+  then
+    warn "$input: cannot read"
+    return 1
+  fi
+
+  while IFS='=' read -r key value
+  do
+    case "$key" in
+      width)                w="$value" ;;
+      height)               h="$value" ;;
+      display_aspect_ratio) dar="$value" ;;
+      r_frame_rate)         rfr="$value" ;;
+      bit_rate)             vbr="$value" ;;
+    esac
+  done < <(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height,display_aspect_ratio,r_frame_rate,bit_rate \
+    -of default=noprint_wrappers=1 -i "$input" 2>/dev/null)
+
+  while IFS='=' read -r key value
+  do
+    case "$key" in
+      bit_rate) abr="$value" ;;
+    esac
+  done < <(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate \
+    -of default=noprint_wrappers=1 -i "$input" 2>/dev/null)
+
+  rot=$(ffprobe -v error -select_streams v:0 -show_entries stream_side_data=rotation \
+    -of default=noprint_wrappers=1:nokey=1 -i "$input" 2>/dev/null | head -1)
+
+  # ffprobe writes N/A for a field it has no value for
+  [[ "$dur" != "N/A" ]] || dur=""
+  [[ "$obr" != "N/A" ]] || obr=""
+  [[ "$vbr" != "N/A" ]] || vbr=""
+  [[ "$abr" != "N/A" ]] || abr=""
+
+  # a still image reports a nominal frame rate that means nothing
+  if [[ -z "$dur" ]]
+  then
+    rfr=""
+  fi
+
+  # A rotation of 90 or 270 means the file displays transposed: a phone stores
+  # a landscape frame and attaches a note to turn it when playing. ffprobe
+  # reports that stored layout, but ffmpeg applies the rotation before any
+  # filter sees a frame, so every other command here works on the displayed
+  # size. Report the same thing they act on.
+  if [[ "$rot" =~ ^-?[0-9]+$ ]] && (( (rot % 180 + 180) % 180 == 90 ))
+  then
+    swap="$w"
+    w="$h"
+    h="$swap"
+
+    if [[ "$dar" == *:* ]]
+    then
+      dar="${dar#*:}:${dar%:*}"
+    fi
+  fi
+
+  if [[ -n "$w" && -n "$h" ]]
+  then
+    field dimensions "${w}x${h}"
+    field aspect "$(fmt_aspect "$dar" "$w" "$h")"
+  fi
+
+  if [[ -n "$rot" ]]
+  then
+    field rotation "${rot} degrees"
+  fi
+
+  if [[ -n "$dur" ]]
+  then
+    field duration "$(fmt_duration "$dur")"
+  fi
+
+  if [[ -n "$rfr" ]]
+  then
+    field fps "$(fmt_fps "$rfr")"
+  fi
+
+  field size "$(fmt_size "$size")"
+
+  if [[ -n "$obr" ]]
+  then
+    field bitrate "$(fmt_bitrate "$obr")"
+  fi
+
+  if [[ -n "$vbr" ]]
+  then
+    field "video bitrate" "$(fmt_bitrate "$vbr")"
+  fi
+
+  if [[ -n "$abr" ]]
+  then
+    field "audio bitrate" "$(fmt_bitrate "$abr")"
+  fi
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+for cmd in ffprobe numfmt awk
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+failed=0
+first=true
+
+for input in "${inputs[@]}"
+do
+  if [[ ${#inputs[@]} -gt 1 ]]
+  then
+    $first || echo
+    printf '%s\n' "$input"
+  fi
+
+  first=false
+
+  if ! report_one "$input"
+  then
+    failed=$((failed + 1))
+  fi
+done
+
+[[ $failed -eq 0 ]] || exit 1

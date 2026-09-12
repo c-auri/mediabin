@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+
+# Scale a video to a given width, up or down, writing next to each input.
+#
+# Scaling means a full re-encode, so unlike mute this is neither instant nor
+# lossless. The encode settings are fixed rather than taken from the source:
+# the source's own CRF is not recoverable in any reliable way, since only
+# libx264 records it and only as a string buried in the bitstream.
+
+set -euo pipefail
+
+summary="scale a video to a given width, keeping the aspect ratio"
+prog=${MB_PROG:-${0##*/}}
+
+crf=23
+preset="slow"
+width=""
+force=false
+output=""
+inputs=()
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog -width N [options] <file>...
+
+Writes <stem>-<width>.<ext> next to each input, so runs at different widths do
+not collide. The height follows the aspect ratio, rounded to an even number
+because libx264 rejects odd dimensions.
+
+Upscaling is allowed. Use 'mb info' first if you want to know what a file
+currently is.
+
+The video is re-encoded with libx264 at crf $crf, preset $preset. Audio is
+copied untouched; use 'mb mute' if you want it gone.
+
+Options:
+  -width N       target width in pixels (required)
+  -o FILE        output path, only valid with a single input
+  -force         overwrite an existing output file
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+Exit status is 0 when every file converted, 1 when any file failed, and 2 for a
+usage error or a missing dependency.
+EOF
+}
+
+function need_value
+{
+  # $1 = flag name, $2 = number of arguments still unparsed
+  [[ $2 -ge 2 ]] || die "$1 requires a value"
+}
+
+# The video stream's codec name, empty for a file with no video stream at all.
+# The call exits 0 in that empty case, so emptiness is the test, not the status.
+function video_codec
+{
+  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# A still image opens through one of ffmpeg's image demuxers (png_pipe,
+# jpeg_pipe, webp_pipe, image2). Forcing libx264 into one of those writes a raw
+# h264 stream under an image extension, which is a broken file rather than an
+# error, so these are skipped outright.
+function is_still_image
+{
+  local fmt
+  fmt=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 -i "$1" 2>/dev/null)
+  [[ "$fmt" == *_pipe || "$fmt" == "image2" ]]
+}
+
+function video_width
+{
+  ffprobe -v error -select_streams v:0 -show_entries stream=width \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# The input's own name with a suffix added before its extension, in the input's
+# directory. The container does not change, so the name has to differ some
+# other way.
+function sibling
+{
+  # $1 = input path, $2 = suffix
+  local dir base stem ext name
+  dir=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  stem="${base%.*}"
+  ext="${base##*.}"
+
+  # a basename with no dot leaves stem and ext both equal to the whole thing
+  if [[ "$stem" == "$base" ]]
+  then
+    ext=""
+  fi
+
+  # a dotfile with no second extension strips to nothing, so keep all of it
+  if [[ -z "$stem" ]]
+  then
+    stem="$base"
+    ext=""
+  fi
+
+  if [[ -n "$ext" ]]
+  then
+    name="$stem-$2.$ext"
+  else
+    name="$stem-$2"
+  fi
+
+  if [[ "$dir" == "." ]]
+  then
+    printf '%s\n' "$name"
+  else
+    printf '%s/%s\n' "$dir" "$name"
+  fi
+}
+
+function same_file
+{
+  [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$2")" ]]
+}
+
+# ffmpeg reads a leading dash as an option, so such a path needs a ./ in front
+function ffpath
+{
+  case "$1" in
+    -*) printf './%s\n' "$1" ;;
+    *)  printf '%s\n' "$1" ;;
+  esac
+}
+
+function dims_of
+{
+  local dims
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0 -i "$1" 2>/dev/null)
+  printf '%s' "${dims/,/x}"
+}
+
+function size_of
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$(stat -c %s -- "$1")"
+}
+
+function convert_one
+{
+  local input="$1" out clobber source_width
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  if [[ -z "$(video_codec "$input")" ]]
+  then
+    warn "$input: no video stream, skipping"
+    return 1
+  fi
+
+  if is_still_image "$input"
+  then
+    warn "$input: still image, not a video, skipping"
+    return 1
+  fi
+
+  source_width=$(video_width "$input")
+
+  if [[ "$source_width" == "$width" ]]
+  then
+    warn "$input: already $width wide, skipping"
+    return 1
+  fi
+
+  if [[ -n "$output" ]]
+  then
+    out="$output"
+  else
+    out=$(sibling "$input" "$width")
+  fi
+
+  if same_file "$input" "$out"
+  then
+    warn "$input: output would overwrite the input"
+    return 1
+  fi
+
+  if [[ -e "$out" ]] && ! $force
+  then
+    warn "$input: $out already exists (use -force to overwrite)"
+    return 1
+  fi
+
+  if $force
+  then
+    clobber="-y"
+  else
+    clobber="-n"
+  fi
+
+  # -2 rather than -1 for the height: it preserves the aspect ratio but rounds
+  # to an even number, and libx264 refuses an odd one outright.
+  if ! ffmpeg -hide_banner "$clobber" -v warning -stats -i "$input" \
+    -vf "scale=$width:-2:flags=lanczos" \
+    -c:v libx264 -crf "$crf" -preset "$preset" -pix_fmt yuv420p \
+    -c:a copy \
+    "$(ffpath "$out")"
+  then
+    warn "$input: ffmpeg failed"
+    return 1
+  fi
+
+  printf 'wrote %s (%s, %s)\n' "$out" "$(dims_of "$out")" "$(size_of "$out")"
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -width)
+      need_value "$1" $#
+      [[ "$2" =~ ^[0-9]+$ ]] || die "-width needs a whole number of pixels, got '$2'"
+      [[ "$2" -gt 0 ]] || die "-width must be greater than zero"
+      width="$2"
+      shift 2
+      ;;
+    -o)
+      need_value "$1" $#
+      output="$2"
+      shift 2
+      ;;
+    -force)
+      force=true
+      shift
+      ;;
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+if [[ -z "$width" ]]
+then
+  die "-width is required (see $prog -h)"
+fi
+
+if [[ -n "$output" && ${#inputs[@]} -gt 1 ]]
+then
+  die "-o takes a single input, got ${#inputs[@]}"
+fi
+
+for cmd in ffmpeg ffprobe numfmt
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+converted=0
+failed=0
+
+for input in "${inputs[@]}"
+do
+  if convert_one "$input"
+  then
+    converted=$((converted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done
+
+if [[ ${#inputs[@]} -gt 1 ]]
+then
+  printf '\n%d converted, %d failed\n' "$converted" "$failed"
+fi
+
+[[ $failed -eq 0 ]] || exit 1
