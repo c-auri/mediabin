@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+
+# Mirror an image or video left to right, writing next to each input.
+#
+# How much this costs depends on the file. A jpeg goes through jpegtran, which
+# rewrites the DCT coefficients directly and is genuinely lossless. A png or a
+# gif is re-encoded by its own encoder, which is also lossless, and in the gif
+# case keeps the source palette because flipping moves pixels without inventing
+# colours. A video has to be re-encoded and does lose quality.
+
+set -euo pipefail
+
+summary="mirror an image or video left to right"
+prog=${MB_PROG:-${0##*/}}
+
+crf=23
+preset="slow"
+force=false
+output=""
+inputs=()
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog [options] <file>...
+
+Writes <stem>-mirrored.<ext> next to each input, keeping the same format.
+
+A jpeg is mirrored losslessly with jpegtran. A png or gif is re-encoded by its
+own encoder, which is also lossless. A video is re-encoded with libx264 at crf
+$crf, preset $preset, with audio copied untouched.
+
+Mirroring is its own inverse, so running it twice returns the original. On a
+jpeg that is exact; on a video the second pass costs another generation.
+
+Options:
+  -o FILE        output path, only valid with a single input
+  -force         overwrite an existing output file
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+Exit status is 0 when every file converted, 1 when any file failed, and 2 for a
+usage error or a missing dependency.
+EOF
+}
+
+function need_value
+{
+  # $1 = flag name, $2 = number of arguments still unparsed
+  [[ $2 -ge 2 ]] || die "$1 requires a value"
+}
+
+# The video stream's codec name, empty for a file with no video stream at all.
+# The call exits 0 in that empty case, so emptiness is the test, not the status.
+function video_codec
+{
+  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+function container_format
+{
+  ffprobe -v error -show_entries format=format_name -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# Still images and gif keep their own encoder. Forcing libx264 into one of them
+# writes a raw h264 stream under an image extension, which is a broken file
+# rather than an error.
+function is_image_like
+{
+  local fmt
+  fmt=$(container_format "$1")
+  [[ "$fmt" == *_pipe || "$fmt" == "image2" || "$fmt" == "gif" ]]
+}
+
+function is_jpeg
+{
+  is_image_like "$1" && [[ "$(video_codec "$1")" == "mjpeg" ]]
+}
+
+# The input's own name with a suffix added before its extension, in the input's
+# directory. The format does not change, so the name has to differ some other
+# way.
+function sibling
+{
+  # $1 = input path, $2 = suffix
+  local dir base stem ext name
+  dir=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  stem="${base%.*}"
+  ext="${base##*.}"
+
+  # a basename with no dot leaves stem and ext both equal to the whole thing
+  if [[ "$stem" == "$base" ]]
+  then
+    ext=""
+  fi
+
+  # a dotfile with no second extension strips to nothing, so keep all of it
+  if [[ -z "$stem" ]]
+  then
+    stem="$base"
+    ext=""
+  fi
+
+  if [[ -n "$ext" ]]
+  then
+    name="$stem-$2.$ext"
+  else
+    name="$stem-$2"
+  fi
+
+  if [[ "$dir" == "." ]]
+  then
+    printf '%s\n' "$name"
+  else
+    printf '%s/%s\n' "$dir" "$name"
+  fi
+}
+
+function same_file
+{
+  [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$2")" ]]
+}
+
+# ffmpeg and jpegtran both read a leading dash as an option, so such a path
+# needs a ./ in front
+function ffpath
+{
+  case "$1" in
+    -*) printf './%s\n' "$1" ;;
+    *)  printf '%s\n' "$1" ;;
+  esac
+}
+
+function dims_of
+{
+  local dims
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0 -i "$1" 2>/dev/null)
+  printf '%s' "${dims/,/x}"
+}
+
+function size_of
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$(stat -c %s -- "$1")"
+}
+
+function convert_one
+{
+  local input="$1" out clobber
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  if [[ -z "$(video_codec "$input")" ]]
+  then
+    warn "$input: no image or video stream, skipping"
+    return 1
+  fi
+
+  if [[ -n "$output" ]]
+  then
+    out="$output"
+  else
+    out=$(sibling "$input" mirrored)
+  fi
+
+  if same_file "$input" "$out"
+  then
+    warn "$input: output would overwrite the input"
+    return 1
+  fi
+
+  if [[ -e "$out" ]] && ! $force
+  then
+    warn "$input: $out already exists (use -force to overwrite)"
+    return 1
+  fi
+
+  if $force
+  then
+    clobber="-y"
+  else
+    clobber="-n"
+  fi
+
+  if is_jpeg "$input"
+  then
+    # jpegtran transforms the coefficients in place of decoding and re-encoding,
+    # so the pixels come back untouched. A failure leaves a truncated file
+    # behind, since the shell creates the target before jpegtran runs.
+    if ! jpegtran -flip horizontal "$(ffpath "$input")" > "$out"
+    then
+      rm -f -- "$out"
+      warn "$input: jpegtran failed"
+      return 1
+    fi
+  elif is_image_like "$input"
+  then
+    if ! ffmpeg -hide_banner "$clobber" -v warning -i "$input" \
+      -vf hflip \
+      "$(ffpath "$out")"
+    then
+      warn "$input: ffmpeg failed"
+      return 1
+    fi
+  else
+    if ! ffmpeg -hide_banner "$clobber" -v warning -stats -i "$input" \
+      -vf hflip \
+      -c:v libx264 -crf "$crf" -preset "$preset" -pix_fmt yuv420p \
+      -c:a copy \
+      "$(ffpath "$out")"
+    then
+      warn "$input: ffmpeg failed"
+      return 1
+    fi
+  fi
+
+  printf 'wrote %s (%s, %s)\n' "$out" "$(dims_of "$out")" "$(size_of "$out")"
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -o)
+      need_value "$1" $#
+      output="$2"
+      shift 2
+      ;;
+    -force)
+      force=true
+      shift
+      ;;
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "$output" && ${#inputs[@]} -gt 1 ]]
+then
+  die "-o takes a single input, got ${#inputs[@]}"
+fi
+
+for cmd in ffmpeg ffprobe numfmt jpegtran
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+converted=0
+failed=0
+
+for input in "${inputs[@]}"
+do
+  if convert_one "$input"
+  then
+    converted=$((converted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done
+
+if [[ ${#inputs[@]} -gt 1 ]]
+then
+  printf '\n%d converted, %d failed\n' "$converted" "$failed"
+fi
+
+[[ $failed -eq 0 ]] || exit 1
