@@ -88,7 +88,7 @@ The one command of the three with a real decision in it. Three different things 
 
 1. **Lossy, no alpha.** The common case, a photo saved by a website. jpg.
 1. **Lossless, or any alpha channel.** Screenshots, logos, UI captures. jpg is wrong twice here: it flattens transparency onto a background nobody chose, and it adds generation loss to an image that had none. png.
-1. **Animated.** Not a still image at all. ImageMagick will write `shot-0.jpg`, `shot-1.jpg` and so on, one file per frame, which is never what was wanted. This goes down the same ffmpeg path as `fromgif` and produces mp4.
+1. **Animated.** Not a still image at all. ImageMagick will write `shot-0.jpg`, `shot-1.jpg` and so on, one file per frame, which is never what was wanted. This produces mp4, but it cannot reuse the `fromgif` path: ffmpeg's webp decoder handles single still images only and fails outright on an animation with `image data not found`, and none of the libwebp tools that would help (`anim_dump`, `webpmux`, `dwebp`) are installed. ImageMagick reads the frames correctly, so the animation goes through two stages instead: `magick <input> -coalesce` writes the frames into a `mktemp -d` as png, and ffmpeg encodes that sequence with the same settings `fromgif` uses. `magick` can write the mp4 by itself, but it discards the source timing: a three frame source came back as 21 frames at 25 fps.
 
 The third case stays in `fromwebp` rather than being refused. `from<format>` means "get this file out of a bad format", and the target following from what the file actually contains is the whole point of the name; refusing would leave animated webp as the one format in the set with no command that takes it.
 
@@ -112,6 +112,10 @@ So: frame count above 1 selects the mp4 path, alpha reported as anything other t
 That last one is the shaky part of the rule. `%Q` is not read off the webp header; it is what ImageMagick infers, and it infers 92 for every lossy file regardless of the quality it was actually encoded at. The one thing it does distinguish is lossless, which reads 100, so the rule works. But a lossy file encoded at quality 100 also reads 100 and lands in png too. That misfire costs disk space and nothing else, which is the right direction for the error to point.
 
 `-jpg` and `-png` override the choice for a whole batch. They do not override the animated case, which has no still-image answer to give.
+
+The format field matters as much as the other three. `magick identify` succeeds on any image it can read, so without checking `%m` for `WEBP` a png handed to `fromwebp` is cheerfully converted to jpg rather than skipped.
+
+Frame timing for an animation comes from `magick identify -format '%T'`, which reports centiseconds per frame. The rate is taken from the first frame and applied to all of them, passed to ffmpeg as the exact fraction `-framerate 100/<delay>` so no float arithmetic is involved. A source whose frames have different delays is converted at the first frame's rate with a warning saying so; getting that exactly right needs the concat demuxer and a per-frame duration list, which is not worth it until a real file needs it. A delay of 0 is legal in the format and means "as fast as possible", so it is clamped to 10cs the way browsers do.
 
 The jpg encode uses a fixed quality (92) rather than trying to match the source, since webp and jpeg quality scales do not mean the same thing.
 

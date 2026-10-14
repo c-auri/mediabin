@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+
+# Convert webp files out of webp, one per argument, writing next to each input.
+#
+# Three different things ship as .webp and the right target differs for each:
+# a lossy photo becomes jpg, a lossless or transparent image becomes png, and
+# an animation becomes mp4. The choice follows what the file actually contains.
+#
+# Nothing is deleted. Removing the originals is a separate step, gated on the
+# exit status.
+
+set -euo pipefail
+
+summary="convert webp to jpg, png or mp4 depending on what it holds"
+prog=${MB_PROG:-${0##*/}}
+
+quality=92
+force=false
+override=""
+output=""
+inputs=()
+tmp=""
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function cleanup
+{
+  [[ -z "$tmp" ]] || rm -rf -- "$tmp"
+}
+
+trap cleanup EXIT
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog [options] <file.webp>...
+
+Writes next to each input, picking the target from the file's own contents:
+
+  lossy, no alpha        jpg at quality $quality
+  lossless, or any alpha  png, since jpg would flatten transparency and add
+                         generation loss to an image that had none
+  animated               mp4, because a still target would write one file
+                         per frame
+
+The webp is left alone. Deleting the originals is a separate step, which the
+exit status makes safe to chain:
+
+  $prog *.webp && rm *.webp
+
+Anything that is not a webp is skipped with a warning and counted as a failure.
+
+Options:
+  -jpg           force jpg for every still image in the batch
+  -png           force png for every still image in the batch
+  -o FILE        output path, only valid with a single input
+  -force         overwrite an existing output file
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+-jpg and -png do not apply to an animation, which has no still answer to give.
+
+Exit status is 0 when every file converted, 1 when any file failed, and 2 for a
+usage error or a missing dependency.
+EOF
+}
+
+function need_value
+{
+  # $1 = flag name, $2 = number of arguments still unparsed
+  [[ $2 -ge 2 ]] || die "$1 requires a value"
+}
+
+# ffmpeg, magick and jpegtran all read a leading dash as an option, so such a
+# path needs a ./ in front
+function ffpath
+{
+  case "$1" in
+    -*) printf './%s\n' "$1" ;;
+    *)  printf '%s\n' "$1" ;;
+  esac
+}
+
+# The input's own name with its extension replaced, in the input's directory.
+function sibling
+{
+  # $1 = input path, $2 = new extension
+  local dir base stem
+  dir=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  stem="${base%.*}"
+
+  # a dotfile with no second extension strips to nothing, so keep all of it
+  if [[ -z "$stem" ]]
+  then
+    stem="$base"
+  fi
+
+  if [[ "$dir" == "." ]]
+  then
+    printf '%s.%s\n' "$stem" "$2"
+  else
+    printf '%s/%s.%s\n' "$dir" "$stem" "$2"
+  fi
+}
+
+function same_file
+{
+  [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$2")" ]]
+}
+
+function dims_of
+{
+  local dims
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0 -i "$1" 2>/dev/null)
+  printf '%s' "${dims/,/x}"
+}
+
+function size_of
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$(stat -c %s -- "$1")"
+}
+
+# Format, frame count, alpha type and quality, from the first frame. The format
+# is checked because magick identify succeeds on any image it can read, so
+# without it a png handed to this command would be cheerfully turned into a jpg.
+# Alpha reported as
+# anything but Undefined means the image carries transparency. %Q is what
+# ImageMagick infers rather than a header field: it reads 92 for every lossy
+# file whatever it was really encoded at, and 100 for a lossless one, so 100 is
+# usable as the lossless signal even though it is not a real quality. A lossy
+# file encoded at 100 lands in png too, which costs disk space and nothing else.
+function webp_facts
+{
+  magick identify -format '%m|%n|%A|%Q\n' "$(ffpath "$1")" 2>/dev/null | head -1
+}
+
+# Centiseconds per frame, one value per frame.
+function frame_delays
+{
+  magick identify -format '%T ' "$(ffpath "$1")" 2>/dev/null
+}
+
+function convert_still
+{
+  # $1 = input, $2 = output, $3 = target extension
+  if [[ "$3" == "jpg" ]]
+  then
+    # jpg has no alpha channel, so make the flattening explicit rather than
+    # leaving the background to whatever the file happens to carry
+    magick "$(ffpath "$1")" -background white -alpha remove -alpha off \
+      -quality "$quality" "$(ffpath "$2")"
+  else
+    magick "$(ffpath "$1")" "$(ffpath "$2")"
+  fi
+}
+
+function convert_animation
+{
+  # $1 = input, $2 = output, $3 = -y or -n
+  local delays first delay d
+
+  rm -f -- "$tmp"/fr-*.png
+
+  # -coalesce so every frame is a whole image: webp frames may be partial
+  if ! magick "$(ffpath "$1")" -coalesce "$tmp/fr-%05d.png" 2>/dev/null
+  then
+    warn "$1: could not extract frames"
+    return 1
+  fi
+
+  read -r -a delays <<< "$(frame_delays "$1")"
+
+  if [[ ${#delays[@]} -eq 0 ]]
+  then
+    warn "$1: could not read frame delays"
+    return 1
+  fi
+
+  first="${delays[0]}"
+
+  for d in "${delays[@]}"
+  do
+    if [[ "$d" != "$first" ]]
+    then
+      warn "$1: frame delays vary, using ${first}cs for every frame"
+      break
+    fi
+  done
+
+  delay="$first"
+
+  # a delay of 0 is legal and means "as fast as possible"; clamp it the way
+  # browsers do rather than dividing by zero
+  if [[ ! "$delay" =~ ^[1-9][0-9]*$ ]]
+  then
+    delay=10
+  fi
+
+  # 100/delay is exact as a fraction, so no float arithmetic is needed. The
+  # encode settings match fromgif: yuv420p for player compatibility, the scale
+  # expression to force even dimensions, faststart for the metadata.
+  ffmpeg -hide_banner "$3" -v warning -stats \
+    -framerate "100/$delay" -start_number 0 -i "$tmp/fr-%05d.png" \
+    -movflags faststart \
+    -pix_fmt yuv420p \
+    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+    "$(ffpath "$2")"
+}
+
+function convert_one
+{
+  local input="$1" out clobber facts fmt frames alpha qual target animated=false
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  facts=$(webp_facts "$input")
+
+  if [[ -z "$facts" ]]
+  then
+    warn "$input: cannot read, skipping"
+    return 1
+  fi
+
+  IFS='|' read -r fmt frames alpha qual <<< "$facts"
+
+  if [[ "$fmt" != "WEBP" ]]
+  then
+    warn "$input: not a webp, skipping"
+    return 1
+  fi
+
+  if [[ ! "$frames" =~ ^[0-9]+$ ]]
+  then
+    warn "$input: could not read frame count, skipping"
+    return 1
+  fi
+
+  if [[ "$frames" -gt 1 ]]
+  then
+    animated=true
+    target="mp4"
+  elif [[ -n "$override" ]]
+  then
+    target="$override"
+  elif [[ "$alpha" != "Undefined" ]]
+  then
+    target="png"
+  elif [[ "$qual" == "100" ]]
+  then
+    target="png"
+  else
+    target="jpg"
+  fi
+
+  if [[ -n "$output" ]]
+  then
+    out="$output"
+  else
+    out=$(sibling "$input" "$target")
+  fi
+
+  if same_file "$input" "$out"
+  then
+    warn "$input: output would overwrite the input"
+    return 1
+  fi
+
+  if [[ -e "$out" ]] && ! $force
+  then
+    warn "$input: $out already exists (use -force to overwrite)"
+    return 1
+  fi
+
+  if $force
+  then
+    clobber="-y"
+  else
+    clobber="-n"
+  fi
+
+  if $animated
+  then
+    if ! convert_animation "$input" "$out" "$clobber"
+    then
+      return 1
+    fi
+  else
+    if ! convert_still "$input" "$out" "$target"
+    then
+      warn "$input: magick failed"
+      return 1
+    fi
+  fi
+
+  printf 'wrote %s (%s, %s)\n' "$out" "$(dims_of "$out")" "$(size_of "$out")"
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -jpg)
+      [[ -z "$override" || "$override" == "jpg" ]] || die "-jpg and -png are mutually exclusive"
+      override="jpg"
+      shift
+      ;;
+    -png)
+      [[ -z "$override" || "$override" == "png" ]] || die "-jpg and -png are mutually exclusive"
+      override="png"
+      shift
+      ;;
+    -o)
+      need_value "$1" $#
+      output="$2"
+      shift 2
+      ;;
+    -force)
+      force=true
+      shift
+      ;;
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "$output" && ${#inputs[@]} -gt 1 ]]
+then
+  die "-o takes a single input, got ${#inputs[@]}"
+fi
+
+# magick by name, never convert: the ImageMagick 6 at /usr/bin/convert reports
+# %A differently and handles a multi-frame file differently, so a silent
+# fallback would probe with different semantics than the rules above assume.
+for cmd in magick ffmpeg ffprobe numfmt
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+tmp=$(mktemp -d)
+
+converted=0
+failed=0
+
+for input in "${inputs[@]}"
+do
+  if convert_one "$input"
+  then
+    converted=$((converted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done
+
+if [[ ${#inputs[@]} -gt 1 ]]
+then
+  printf '\n%d converted, %d failed\n' "$converted" "$failed"
+fi
+
+[[ $failed -eq 0 ]] || exit 1
