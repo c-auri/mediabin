@@ -10,15 +10,15 @@ These are editing utilities, not playback. Every command takes file paths on the
 
 A name should hint at what the command produces. That is the whole rule: there is nothing to say about length or parts of speech, and `info` reads as clearly as `resize` does.
 
-| old         | new      | backend    |
-|-------------|----------|------------|
-| `ffrotate`  | `rotate` | ffmpeg     |
-| `gif-loop`  | `loop`   | ffmpeg     |
-| `cnvrt`     | `deweb`  | both       |
+| old         | new                             | backend    |
+|-------------|---------------------------------|------------|
+| `ffrotate`  | `rotate`                        | ffmpeg     |
+| `gif-loop`  | `loop`                          | ffmpeg     |
+| `cnvrt`     | `fromwebp`, `fromgif`, `togif`  | both       |
 
 The names can be plain and literal because nothing here plays anything: with no player in the set, `loop` cannot be read as a playback mode nor `rotate` as "play this rotated". That is what the exclusion above buys, and the reason it is worth holding to.
 
-`deweb` covers webp to jpg exactly and gif to mp4 loosely, since gif is more an awkward legacy format than a web one. It names the blast radius rather than the mechanism, and still undersells it: the command sweeps the whole current directory and deletes each original after a successful conversion. The old name was vowel-stripped to dodge `convert`, ImageMagick's own binary. Nothing in `commands/` is ever on `PATH`, so that pressure is gone. `fromwebp`, `fromgif` and `togif` replace it: each does one conversion, takes the files it is given, and deletes nothing.
+`cnvrt` did two unrelated conversions, webp to jpg and gif to mp4, over the whole current directory, deleting each original after a successful conversion. Its name was vowel-stripped to dodge `convert`, ImageMagick's own binary. It was split into `fromwebp`, `fromgif` and `togif`, which each do one conversion, take the files they are given, and delete nothing.
 
 The conversion commands pair up by prefix. `from<format>` means "get this file out of a bad format", with the target implied by what the file actually contains. `to<format>` means "produce this format", with the source being anything ffmpeg can read. `gif` appears on both sides because it is a bad container and a useful deliverable at the same time.
 
@@ -30,7 +30,7 @@ A single dispatcher named `mb` is the only thing that reaches `PATH`. Subcommand
 mediabin/
   mb                 # dispatcher
   commands/
-    rotate loop deweb
+    fromgif fromwebp info loop mirror mute resize rotate togif
   lib/               # shared helpers, only once something is actually shared
   design.md
   README.md
@@ -114,7 +114,7 @@ Decisions behind individual commands that are not visible from the code.
 
 ## Open questions
 
-**Older scripts against the house style.** "Files in, files out" settles the interface for new commands, but the scripts that predate it still disagree. `loop` takes two positional arguments plus `FPS` and `CRF` as environment variable overrides. `deweb` takes nothing at all and operates on the current directory. `rotate` exits 1 rather than 2 on a usage error. Each is worth bringing in line when it is next touched.
+**Older scripts against the house style.** "Files in, files out" settles the interface for new commands, but the scripts that predate it still disagree. `loop` takes two positional arguments plus `FPS` and `CRF` as environment variable overrides. `rotate` exits 1 rather than 2 on a usage error. Each is worth bringing in line when it is next touched.
 
 **Overlap with `loop`.** `loop` normalises a gif to a lossless mkv as its first stage, which is `fromgif` with a different codec, before boomeranging it. Two commands quietly sharing a first step is how the collection starts drifting. When `loop` is next touched, decide whether the shared stage moves.
 
@@ -123,7 +123,6 @@ Decisions behind individual commands that are not visible from the code.
 ## Still to do
 
 1. Write `mb`.
-1. Bring each script up to the conventions above, one pass per file. `rotate` and `deweb` are still `#!/bin/bash`; `deweb` uses `set -e` and needs `set -euo pipefail`, keeping its `shopt -s nullglob`, which is what makes the loops skip when nothing matches. All three need the `summary` variable printed from their usage text, and `deweb` has no usage function at all yet. `rotate` also switches from `prog=${0##*/}` to the `MB_PROG` form.
 1. Fix the usage text in `loop`, which hardcodes the string `gif-loop.sh` in three places including its examples.
 1. Symlink `~/.local/bin/mb` to `mediabin/mb` and verify each command still runs.
 1. Write `README.md`: the three commands, one line each, plus the installation symlink and the conventions a fourth script would need to follow.
