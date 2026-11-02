@@ -18,7 +18,9 @@ A name should hint at what the command produces. That is the whole rule: there i
 
 The names can be plain and literal because nothing here plays anything: with no player in the set, `loop` cannot be read as a playback mode nor `rotate` as "play this rotated". That is what the exclusion above buys, and the reason it is worth holding to.
 
-`deweb` covers webp to jpg exactly and gif to mp4 loosely, since gif is more an awkward legacy format than a web one. It names the blast radius rather than the mechanism, and still undersells it: the command sweeps the whole current directory and deletes each original after a successful conversion. The old name was vowel-stripped to dodge `convert`, ImageMagick's own binary. Nothing in `commands/` is ever on `PATH`, so that pressure is gone.
+`deweb` covers webp to jpg exactly and gif to mp4 loosely, since gif is more an awkward legacy format than a web one. It names the blast radius rather than the mechanism, and still undersells it: the command sweeps the whole current directory and deletes each original after a successful conversion. The old name was vowel-stripped to dodge `convert`, ImageMagick's own binary. Nothing in `commands/` is ever on `PATH`, so that pressure is gone. `fromwebp`, `fromgif` and `togif` replace it: each does one conversion, takes the files it is given, and deletes nothing.
+
+The conversion commands pair up by prefix. `from<format>` means "get this file out of a bad format", with the target implied by what the file actually contains. `to<format>` means "produce this format", with the source being anything ffmpeg can read. `gif` appears on both sides because it is a bad container and a useful deliverable at the same time.
 
 ## Architecture
 
@@ -72,13 +74,51 @@ Reading the variable rather than executing `<cmd> --help` to collect it is delib
 
 Usage text derives the program name from the environment rather than from `$0`: `prog=${MB_PROG:-${0##*/}}`, with the dispatcher exporting `MB_PROG="mb rotate"` before the exec. Without this, `rotate -h` under the dispatcher would tell the reader to run `rotate -cw input.mp4`, which is not a command that exists. The fallback keeps the output correct when a script is run directly out of `commands/` during debugging.
 
+### Files in, files out
+
+Commands that write files share one shape for arguments, output, failure and exit status.
+
+**Arguments.** One or more input paths, so `mb togif *.mp4` and `mb togif img/*.mp4` cost nothing beyond looping over `"$@"`. No arguments at all is a usage error. A glob that matches nothing arrives as its own literal text, since the interactive shell has no `nullglob`, and is reported as not existing, in those words, rather than handed to ffmpeg. Flags are single-dash multi-character, following ffmpeg rather than GNU, and cannot be bundled. `--` ends options so a file named `-thing.webp` can still be passed, and every path handed to ffmpeg or `magick` gets a `./` in front if it starts with a dash.
+
+**Output paths.** The output goes next to its input, so `img/shot.webp` writes into `img/`, not the working directory. Everything after the last dot in the basename is the extension and is replaced; a basename with no dot gains one, and a dotfile keeps its whole name. A command that keeps the container, like `mute`, adds a suffix before the extension instead. `-o FILE` overrides the derived path, is used exactly as given, and is a usage error with more than one input.
+
+**Overwriting.** Nothing deletes its input. Removing originals is a separate step gated on the exit status, `mb fromwebp *.webp && rm *.webp`, which deletes only when every conversion in the batch worked. Writing over an existing output is the one destructive act left, and the likely one: it happens on the second run of a batch that partly failed the first time. An existing output is a per-file failure unless `-force` is given. An output that resolves to the input itself is a per-file failure that `-force` does not override; the extension rule cannot produce one, but `-o` can.
+
+**Batches.** A batch keeps going after a failure. Aborting on the first bad file is wrong for a command whose normal invocation is a glob: it leaves the run half done at an unpredictable point. An input the command cannot handle is skipped with a warning and counted as a failure, so `mb togif *` in a mixed directory converts what it can. Each success prints one line, read back off the finished file so it describes what was written rather than what was asked for, and a summary closes any run of more than one file:
+
+```
+wrote clip.gif (480x270, 15 fps, 4.2M)
+
+3 converted, 1 failed
+```
+
+**Exit status.** 0 when every file succeeded, 1 when any failed, 2 for a usage error or a missing dependency, which stop the command before it touches any file. Dependencies are checked once before the batch, not per file.
+
+**Probing input type.** Decided by one ffprobe call on the video stream rather than the container, whose `format_name` reports `mov,mp4,m4a,3gp,3g2,mj2` for an mp4 and `png_pipe` for a png:
+
+```
+ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$input"
+```
+
+It prints `gif` for a gif, the codec name for anything else with a picture in it, and nothing for a file with no video stream or an unreadable one. It exits 0 in that empty case, so the test is whether the output is empty.
+
+**ImageMagick is `magick`.** ImageMagick 7, at `~/.local/bin/magick`. The 6.9.11 at `/usr/bin/convert` differs in what `%A` reports and in how it handles a multi-frame file, so a command needing ImageMagick checks for `magick` by name and exits 2 if it is missing, rather than falling back and probing with different semantics.
+
+## Command notes
+
+Decisions behind individual commands that are not visible from the code.
+
+**fromwebp.** An animated webp cannot reuse the `fromgif` path: ffmpeg's webp decoder handles still images only and fails on an animation with `image data not found`, and none of the libwebp tools that would help (`anim_dump`, `webpmux`, `dwebp`) are installed. `magick` reads the frames correctly but discards the source timing when it writes mp4 itself: a three-frame source came back as 21 frames at 25 fps. So frames go through a temp directory as png and ffmpeg encodes them at a rate taken from the first frame's delay. A source whose delays vary gets that rate with a warning; doing it exactly needs the concat demuxer and a per-frame duration list, which is not worth it until a real file needs it. Animations stay in `fromwebp` rather than being refused, since refusing would leave animated webp as the one format with no command that takes it. The jpg quality is fixed at 92 rather than matched to the source, since webp and jpeg quality scales do not mean the same thing.
+
+**togif.** Single pass with `split` rather than a palette written to a temp file. The two-pass form only earns its temp file when `palettegen=stats_mode=diff` is wanted for a mostly-static source, which is a refinement to add when a real clip needs it. Dimensions are untouched unless `-width` is given.
+
 ## Open questions
 
-**Interface consistency across the three.** The scripts disagree about how to take input, because they were written separately. `rotate` uses single-dash multi-character flags, following ffmpeg's convention rather than GNU's. `loop` takes two positional arguments plus `FPS` and `CRF` as environment variable overrides. `deweb` takes nothing at all and operates on the current directory. Under a single entrypoint these read as one tool with three inconsistent interfaces, and every script added from here widens the gap. Worth settling a house style before the fourth one lands; the flag convention is the expensive part to change later.
+**Older scripts against the house style.** "Files in, files out" settles the interface for new commands, but the scripts that predate it still disagree. `loop` takes two positional arguments plus `FPS` and `CRF` as environment variable overrides. `deweb` takes nothing at all and operates on the current directory. `rotate` exits 1 rather than 2 on a usage error. Each is worth bringing in line when it is next touched.
+
+**Overlap with `loop`.** `loop` normalises a gif to a lossless mkv as its first stage, which is `fromgif` with a different codec, before boomeranging it. Two commands quietly sharing a first step is how the collection starts drifting. When `loop` is next touched, decide whether the shared stage moves.
 
 **A `lib/` for shared helpers.** `rotate` carries its own `die()` and `run()`. Nothing else needs them yet. Extract only when a second script does, following the `git-lib` precedent next door.
-
-**A `deweb` keep flag.** `deweb` deletes originals after a successful conversion. A `-k` flag would cover the cases where that is not wanted, and is the only real guardrail available: a naming scheme cannot warn about deletion.
 
 ## Still to do
 
