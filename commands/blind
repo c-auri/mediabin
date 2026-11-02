@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+
+# Extract the audio track from a video, one file per argument, writing next to
+# each input. The counterpart of mute: that takes away the sound, this takes
+# away the picture.
+#
+# The audio is stream copied by default, into whichever container accepts its
+# codec, so there is no quality loss and no encoding time. -mp3 re-encodes for
+# a file that plays everywhere.
+
+set -euo pipefail
+
+summary="extract the audio track from a video, without re-encoding"
+prog=${MB_PROG:-${0##*/}}
+
+mp3=false
+force=false
+output=""
+inputs=()
+
+function die
+{
+  echo "$prog: $1" >&2
+  exit "${2:-2}"
+}
+
+function warn
+{
+  echo "$prog: $1" >&2
+}
+
+function usage
+{
+  cat <<EOF
+$prog: $summary
+
+Usage:
+  $prog [options] <file>...
+
+Writes the first audio track of each input next to it, in the container that
+matches its codec: aac to .m4a, mp3 to .mp3, opus to .opus, vorbis to .ogg,
+flac to .flac, ac3 to .ac3, little-endian pcm to .wav, anything else to .mka.
+The audio is copied rather than re-encoded, so there is no quality loss and no
+encoding time.
+
+A file with no audio, and a file with no video, are both skipped with a warning
+and counted as failures, so a wide glob does not need to be aimed carefully. A
+file with several audio tracks gives its first, with a warning.
+
+Options:
+  -mp3           re-encode to mp3 (VBR, about 190 kbps) for a file that plays
+                 everywhere; an mp3 source is still copied
+  -o FILE        output path, only valid with a single input
+  -force         overwrite an existing output file
+  -h, -help      show this help
+  --             end of options, the rest are input paths
+
+Exit status is 0 when every file converted, 1 when any file failed, and 2 for a
+usage error or a missing dependency.
+EOF
+}
+
+function need_value
+{
+  # $1 = flag name, $2 = number of arguments still unparsed
+  [[ $2 -ge 2 ]] || die "$1 requires a value"
+}
+
+# The video stream's codec name, empty for a file with no video stream at all.
+# The call exits 0 in that empty case, so emptiness is the test, not the status.
+function video_codec
+{
+  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+# The audio stream's codec name, empty for a file with no audio stream.
+function audio_codec
+{
+  ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+    -of csv=p=0 -i "$1" 2>/dev/null
+}
+
+function audio_count
+{
+  ffprobe -v error -select_streams a -show_entries stream=index \
+    -of csv=p=0 -i "$1" 2>/dev/null | wc -l
+}
+
+# The extension of a container that accepts this codec as a stream copy.
+# Matroska takes almost anything, so it is the fallback rather than a failure.
+# wav only holds little-endian pcm; the big-endian kind found in mov falls
+# through to mka.
+function extension_for
+{
+  case "$1" in
+    aac)                      echo m4a ;;
+    mp3)                      echo mp3 ;;
+    opus)                     echo opus ;;
+    vorbis)                   echo ogg ;;
+    flac)                     echo flac ;;
+    ac3)                      echo ac3 ;;
+    pcm_s*le|pcm_f*le|pcm_u8) echo wav ;;
+    *)                        echo mka ;;
+  esac
+}
+
+# The input's own name with its extension replaced, in the input's directory.
+function sibling
+{
+  # $1 = input path, $2 = new extension
+  local dir base stem
+  dir=$(dirname -- "$1")
+  base=$(basename -- "$1")
+  stem="${base%.*}"
+
+  # a dotfile with no second extension strips to nothing, so keep all of it
+  if [[ -z "$stem" ]]
+  then
+    stem="$base"
+  fi
+
+  if [[ "$dir" == "." ]]
+  then
+    printf '%s.%s\n' "$stem" "$2"
+  else
+    printf '%s/%s.%s\n' "$dir" "$stem" "$2"
+  fi
+}
+
+function same_file
+{
+  [[ "$(readlink -f -- "$1")" == "$(readlink -f -- "$2")" ]]
+}
+
+# ffmpeg reads a leading dash as an option, so such a path needs a ./ in front
+function ffpath
+{
+  case "$1" in
+    -*) printf './%s\n' "$1" ;;
+    *)  printf '%s\n' "$1" ;;
+  esac
+}
+
+function size_of
+{
+  # LC_ALL=C so the size reads 4.2M rather than the locale's 4,2M
+  LC_ALL=C numfmt --to=iec -- "$(stat -c %s -- "$1")"
+}
+
+function duration_of
+{
+  local d
+  d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \
+    -i "$1" 2>/dev/null)
+
+  LC_ALL=C awk -v d="$d" 'BEGIN {
+    if (d == "" || d == "N/A") exit
+    t = int(d + 0.5)
+    h = int(t / 3600); m = int((t % 3600) / 60); s = t % 60
+    if (h > 0) printf "%d:%02d:%02d", h, m, s
+    else       printf "%d:%02d", m, s
+  }'
+}
+
+function convert_one
+{
+  local input="$1" out codec count clobber
+  local codec_args=(-c copy)
+
+  if [[ ! -e "$input" ]]
+  then
+    warn "$input: does not exist"
+    return 1
+  fi
+
+  if [[ ! -f "$input" ]]
+  then
+    warn "$input: not a regular file"
+    return 1
+  fi
+
+  codec=$(audio_codec "$input")
+
+  if [[ -z "$codec" ]]
+  then
+    warn "$input: no audio to extract, skipping"
+    return 1
+  fi
+
+  # without this, a glob over a music directory would copy every file to
+  # itself or to a near-duplicate
+  if [[ -z "$(video_codec "$input")" ]]
+  then
+    warn "$input: already audio only, skipping"
+    return 1
+  fi
+
+  count=$(audio_count "$input")
+
+  if [[ "$count" -gt 1 ]]
+  then
+    warn "$input: $count audio tracks, extracting the first"
+  fi
+
+  # an mp3 source is copied even under -mp3: same result, no generation loss
+  if $mp3 && [[ "$codec" != "mp3" ]]
+  then
+    codec_args=(-c:a libmp3lame -q:a 2)
+    codec=mp3
+  fi
+
+  if [[ -n "$output" ]]
+  then
+    out="$output"
+  else
+    out=$(sibling "$input" "$(extension_for "$codec")")
+  fi
+
+  if same_file "$input" "$out"
+  then
+    warn "$input: output would overwrite the input"
+    return 1
+  fi
+
+  if [[ -e "$out" ]] && ! $force
+  then
+    warn "$input: $out already exists (use -force to overwrite)"
+    return 1
+  fi
+
+  if $force
+  then
+    clobber="-y"
+  else
+    clobber="-n"
+  fi
+
+  # -map 0:a:0 selects exactly one stream. Default stream selection would pick
+  # up any video stream it finds, which is what this command leaves behind.
+  if ! ffmpeg -hide_banner "$clobber" -v warning -i "$input" \
+    -map 0:a:0 "${codec_args[@]}" \
+    "$(ffpath "$out")"
+  then
+    warn "$input: ffmpeg failed"
+    return 1
+  fi
+
+  printf 'wrote %s (%s, %s, %s)\n' \
+    "$out" "$(audio_codec "$out")" "$(duration_of "$out")" "$(size_of "$out")"
+}
+
+while [[ $# -gt 0 ]]
+do
+  case "$1" in
+    -mp3)
+      mp3=true
+      shift
+      ;;
+    -o)
+      need_value "$1" $#
+      output="$2"
+      shift 2
+      ;;
+    -force)
+      force=true
+      shift
+      ;;
+    -h|-help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option '$1' (see $prog -h)"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]
+then
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "$output" && ${#inputs[@]} -gt 1 ]]
+then
+  die "-o takes a single input, got ${#inputs[@]}"
+fi
+
+for cmd in ffmpeg ffprobe numfmt awk
+do
+  command -v "$cmd" >/dev/null || die "$cmd not found on PATH"
+done
+
+# Captured rather than piped into grep -q, which would exit at the first match
+# and fail the pipeline under pipefail when ffmpeg takes the SIGPIPE.
+if $mp3 && [[ "$(ffmpeg -hide_banner -encoders 2>/dev/null)" != *libmp3lame* ]]
+then
+  die "this ffmpeg has no libmp3lame encoder, which -mp3 needs"
+fi
+
+converted=0
+failed=0
+
+for input in "${inputs[@]}"
+do
+  if convert_one "$input"
+  then
+    converted=$((converted + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done
+
+if [[ ${#inputs[@]} -gt 1 ]]
+then
+  printf '\n%d converted, %d failed\n' "$converted" "$failed"
+fi
+
+[[ $failed -eq 0 ]] || exit 1

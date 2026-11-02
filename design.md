@@ -22,6 +22,8 @@ The names can be plain and literal because nothing here plays anything: with no 
 
 The conversion commands pair up by prefix. `from<format>` means "get this file out of a bad format", with the target implied by what the file actually contains. `to<format>` means "produce this format", with the source being anything ffmpeg can read. `gif` appears on both sides because it is a bad container and a useful deliverable at the same time.
 
+`blind` is a play on `mute` rather than a literal name: `mute` takes away the sound and keeps the picture, `blind` takes away the picture and keeps the sound. The pair reads better than `audio` or `extract` would. The possible misreading, a video with black frames, is settled by the audio extension on the output and the first line of `-h`.
+
 ## Architecture
 
 A single dispatcher named `mb` is the only thing that reaches `PATH`. Subcommands are ordinary executables in `commands/`, invoked as `mb rotate -cw clip.mp4`.
@@ -118,7 +120,7 @@ Decisions behind individual commands that are not visible from the code.
 
 **Overlap with `loop`.** `loop` normalises a gif to a lossless mkv as its first stage, which is `fromgif` with a different codec, before boomeranging it. Two commands quietly sharing a first step is how the collection starts drifting. When `loop` is next touched, decide whether the shared stage moves.
 
-**A `lib/` for shared helpers.** `rotate` carries its own `die()` and `run()`. Nothing else needs them yet. Extract only when a second script does, following the `git-lib` precedent next door.
+**A `lib/` for shared helpers.** Extract a helper once a second script needs it, following the `git-lib` precedent next door. That point has passed: `die`, `warn`, `need_value`, `sibling`, `same_file`, `ffpath`, `size_of` and the `video_codec` and `audio_codec` probes are copied across most of `commands/`. Extracting them is its own change, separate from adding any one command.
 
 ## Still to do
 
@@ -129,3 +131,4 @@ Decisions behind individual commands that are not visible from the code.
 
 ## Future
 1. Tab completion is a nice-to-have. Not in the scope of initial setup but worth working on eventually.
+1. A `-track N` flag for `blind`, for files with several audio tracks such as a film with dubs. For now it takes the first track and warns, which is enough until a real file needs another.
